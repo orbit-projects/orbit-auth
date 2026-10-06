@@ -1,0 +1,108 @@
+# Copyright 2026-present Orbit Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Bounded time and numeric helpers used at the authentication boundary."""
+
+import math
+import re
+from datetime import datetime
+from typing import TypeGuard
+
+MAX_PATH_BYTES: int = 16 * 1024
+MAX_PATH_PARAMETERS: int = 128
+MAX_PATH_PARAMETER_NAME_LENGTH: int = 127
+_MAX_CORE_CAPACITY: int = 1_000_000
+_MAX_RELATION_ENTRIES: int = 1_024
+_EXCEPTION_TYPE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,127}")
+
+
+def is_finite_number(value: object) -> TypeGuard[int | float]:
+    """Return whether a value is a finite non-boolean integer or floating-point number.
+
+    ``math.isfinite`` can raise ``OverflowError`` for integers too large to convert to a
+    platform float. Core treats those values as invalid policy input rather than leaking an
+    implementation-level exception from a public constructor.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def is_aware_datetime(value: object) -> TypeGuard[datetime]:
+    """Return whether a datetime has a usable UTC offset for cross-process comparisons.
+
+    ``tzinfo`` implementations are application-provided code. Core treats any ordinary
+    exception raised while asking one for its offset as invalid input and fails closed.
+    """
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    try:
+        return value.utcoffset() is not None
+    except Exception:
+        return False
+
+
+def datetime_utc_microseconds(value: object) -> int:
+    """Return an exact UTC ordering key for an aware datetime without range overflow.
+
+    Python compares datetimes with the same ``tzinfo`` by their wall-clock fields and ignores
+    ``fold``. During a daylight-saving fallback, that can reverse the order of two real instants.
+    This integer key applies the UTC offset arithmetically and also supports values near the
+    representable datetime boundaries without calling ``astimezone`` or converting to float.
+    """
+    invalid = "Datetime comparisons require a timezone-aware value with a usable UTC offset."
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError(invalid)
+    try:
+        offset = value.utcoffset()
+    except Exception as exc:
+        raise ValueError(invalid) from exc
+    if offset is None:
+        raise ValueError(invalid)
+    day_microseconds = 86_400_000_000
+    second_microseconds = 1_000_000
+    local_microseconds = (
+        (value.toordinal() - 1) * day_microseconds
+        + value.hour * 3_600 * second_microseconds
+        + value.minute * 60 * second_microseconds
+        + value.second * second_microseconds
+        + value.microsecond
+    )
+    offset_microseconds = (
+        offset.days * 86_400 + offset.seconds
+    ) * second_microseconds + offset.microseconds
+    return local_microseconds - offset_microseconds
+
+
+def safe_exception_type_name(error: BaseException) -> str:
+    """Return a bounded exception type suitable for public diagnostics.
+
+    Exception class names are application-controlled: ``type()`` can create names with control
+    characters or arbitrary length. Core's structured records use identifier-shaped text, so an
+    unsafe name is deliberately generalized instead of letting diagnostics mask the real failure.
+    """
+    name = type(error).__name__
+    return name if _EXCEPTION_TYPE_PATTERN.fullmatch(name) is not None else "Exception"
+
+
+__all__ = [
+    "MAX_PATH_BYTES",
+    "MAX_PATH_PARAMETER_NAME_LENGTH",
+    "MAX_PATH_PARAMETERS",
+    "is_aware_datetime",
+    "is_finite_number",
+    "safe_exception_type_name",
+]
